@@ -2,7 +2,8 @@
 Rolling-origin backtesting framework for Liquid Fund Cash Buffer forecasting.
 
 Trains SeasonalNaive, SARIMAX, and LightGBM at each origin, collects
-per-step metrics, and produces summary tables and diagnostic plots.
+per-step metrics (MAPE, MAE, RMSE, and pinball / quantile loss), and
+produces summary tables and diagnostic plots.
 """
 
 from __future__ import annotations
@@ -37,6 +38,32 @@ from models import (
 
 # Minimum number of training observations (3 full years of monthly data)
 MIN_TRAIN_SIZE = 36
+
+
+def pinball_loss(y: float, q_hat: float, alpha: float) -> float:
+    """Compute the pinball (quantile) loss for a single observation.
+
+    L_α(y, q̂) = max(α·(y − q̂), (1 − α)·(q̂ − y))
+
+    This is the asymmetric loss function used for evaluating quantile
+    forecasts per the competition scoring rubric.  It penalises
+    under-prediction by factor α and over-prediction by factor (1 − α).
+
+    Parameters
+    ----------
+    y : float
+        Actual observed value.
+    q_hat : float
+        Quantile forecast.
+    alpha : float
+        Quantile level (e.g. 0.025, 0.10, 0.50, 0.90, 0.975).
+
+    Returns
+    -------
+    float
+        Non-negative pinball loss.
+    """
+    return max(alpha * (y - q_hat), (1 - alpha) * (q_hat - y))
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +165,14 @@ def rolling_origin_backtest(
                     else np.nan
                 )
 
+                # Pinball (quantile) losses for each PI bound
+                pl_025 = pinball_loss(actual, preds["lower_95"][step], 0.025)
+                pl_10  = pinball_loss(actual, preds["lower_80"][step], 0.10)
+                pl_50  = pinball_loss(actual, pred, 0.50)
+                pl_90  = pinball_loss(actual, preds["upper_80"][step], 0.90)
+                pl_975 = pinball_loss(actual, preds["upper_95"][step], 0.975)
+                pl_avg = (pl_025 + pl_10 + pl_50 + pl_90 + pl_975) / 5.0
+
                 records.append(
                     {
                         "origin": i + 1,
@@ -157,6 +192,12 @@ def rolling_origin_backtest(
                         "upper_95": preds["upper_95"][step],
                         "mae": ae,
                         "mape": ape,
+                        "pinball_q025": pl_025,
+                        "pinball_q10": pl_10,
+                        "pinball_q50": pl_50,
+                        "pinball_q90": pl_90,
+                        "pinball_q975": pl_975,
+                        "pinball_avg": pl_avg,
                     }
                 )
 
@@ -205,7 +246,8 @@ def compute_interval_calibration(
 # ---------------------------------------------------------------------------
 
 def compute_summary_metrics(results_df: pd.DataFrame) -> pd.DataFrame:
-    """Aggregate per-model average MAPE, MAE, RMSE, and interval calibration.
+    """Aggregate per-model average MAPE, MAE, RMSE, pinball loss, and
+    interval calibration.
 
     Parameters
     ----------
@@ -221,17 +263,24 @@ def compute_summary_metrics(results_df: pd.DataFrame) -> pd.DataFrame:
     for model_name in results_df["model_name"].unique():
         sub = results_df[results_df["model_name"] == model_name]
         cal = compute_interval_calibration(results_df, model_name)
-        rows.append(
-            {
-                "model": model_name,
-                "avg_MAPE": sub["mape"].mean(),
-                "avg_MAE": sub["mae"].mean(),
-                "RMSE": np.sqrt((sub["mae"] ** 2).mean()),
-                "cal_80": cal["cal_80"],
-                "cal_95": cal["cal_95"],
-                "n_predictions": len(sub),
-            }
-        )
+        row = {
+            "model": model_name,
+            "avg_MAPE": sub["mape"].mean(),
+            "avg_MAE": sub["mae"].mean(),
+            "RMSE": np.sqrt((sub["mae"] ** 2).mean()),
+            "cal_80": cal["cal_80"],
+            "cal_95": cal["cal_95"],
+            "n_predictions": len(sub),
+        }
+        # Add pinball loss metrics if available
+        if "pinball_avg" in sub.columns:
+            row["avg_pinball_loss"] = sub["pinball_avg"].mean()
+            row["pinball_q025"] = sub["pinball_q025"].mean()
+            row["pinball_q10"] = sub["pinball_q10"].mean()
+            row["pinball_q50"] = sub["pinball_q50"].mean()
+            row["pinball_q90"] = sub["pinball_q90"].mean()
+            row["pinball_q975"] = sub["pinball_q975"].mean()
+        rows.append(row)
 
     summary = pd.DataFrame(rows).set_index("model")
     return summary
@@ -351,6 +400,59 @@ def plot_backtest_results(results_df: pd.DataFrame) -> None:
     fig3.savefig(OUTPUT_DIR / "backtest_actual_vs_pred.png", dpi=150)
     print(f"  → saved {OUTPUT_DIR / 'backtest_actual_vs_pred.png'}")
     plt.close(fig3)
+
+    # ── 4. Pinball loss bar chart ──────────────────────────────────────
+    if "pinball_avg" in results_df.columns:
+        fig4, ax4 = plt.subplots(figsize=(8, 5))
+        pinball_means = [
+            results_df[results_df["model_name"] == m]["pinball_avg"].mean()
+            for m in model_names
+        ]
+        colors = ["#3498DB", "#E74C3C", "#2ECC71", "#9B59B6"][:len(model_names)]
+        bars = ax4.bar(model_names, pinball_means, color=colors)
+        ax4.set_ylabel("Average Pinball Loss (₹ Cr)")
+        ax4.set_title("Backtest — Average Pinball Loss by Model")
+        for bar, val in zip(bars, pinball_means):
+            ax4.text(
+                bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + max(pinball_means) * 0.02,
+                f"{val:.1f}",
+                ha="center",
+                fontsize=10,
+            )
+        fig4.tight_layout()
+        fig4.savefig(OUTPUT_DIR / "backtest_pinball_loss.png", dpi=150)
+        print(f"  → saved {OUTPUT_DIR / 'backtest_pinball_loss.png'}")
+        plt.close(fig4)
+
+        # ── 5. Detailed pinball loss by quantile (grouped bar) ─────────
+        fig5, ax5 = plt.subplots(figsize=(12, 6))
+        quantile_labels = ["q0.025", "q0.10", "q0.50", "q0.90", "q0.975"]
+        quantile_cols = [
+            "pinball_q025", "pinball_q10", "pinball_q50",
+            "pinball_q90", "pinball_q975",
+        ]
+        x = np.arange(len(quantile_labels))
+        n_models = len(model_names)
+        w = 0.8 / max(n_models, 1)
+
+        for j, m in enumerate(model_names):
+            sub = results_df[results_df["model_name"] == m]
+            vals = [sub[col].mean() for col in quantile_cols]
+            ax5.bar(
+                x + j * w - (n_models - 1) * w / 2, vals, w,
+                label=m, color=colors[j],
+            )
+
+        ax5.set_xticks(x)
+        ax5.set_xticklabels(quantile_labels)
+        ax5.set_ylabel("Average Pinball Loss (₹ Cr)")
+        ax5.set_title("Pinball Loss by Quantile Level and Model")
+        ax5.legend()
+        fig5.tight_layout()
+        fig5.savefig(OUTPUT_DIR / "backtest_pinball_by_quantile.png", dpi=150)
+        print(f"  → saved {OUTPUT_DIR / 'backtest_pinball_by_quantile.png'}")
+        plt.close(fig5)
 
 
 # ---------------------------------------------------------------------------
