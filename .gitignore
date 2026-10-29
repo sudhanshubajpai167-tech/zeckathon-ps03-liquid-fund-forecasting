@@ -34,3 +34,6 @@ ENV/
 
 # Large generated datasets (optional: keep synthetic or ignore temp caches)
 *.log
+
+PROJECT_STATUS_REPORT.md
+PROJECT_STATUS.md
